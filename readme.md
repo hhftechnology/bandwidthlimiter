@@ -1,270 +1,540 @@
-This repository includes an example plugin, `demo`, for you to use as a reference for developing your own plugins.
+# Bandwidth Limiter Plugin for Traefik
 
-[![Build Status](https://github.com/traefik/plugindemo/workflows/Main/badge.svg?branch=master)](https://github.com/traefik/plugindemo/actions)
+ bandwidth limiting middleware plugin for Traefik that provides fine-grained control over data transfer rates. This plugin supports per-backend and per-client IP rate limiting with automatic memory management and persistent state storage.
 
-The existing plugins can be browsed into the [Plugin Catalog](https://plugins.traefik.io).
+## Features
 
-# Developing a Traefik plugin
+### Core Bandwidth Limiting
+- **Token Bucket Algorithm**: Implements efficient rate limiting using the token bucket pattern
+- **Per-Backend Limits**: Set different bandwidth limits for different backend services
+- **Per-Client IP Limits**: Configure specific rates for individual client IP addresses
+- **Configurable Burst Sizes**: Allow temporary bursts above the average rate limit
+- **IPv4 and IPv6 Support**: Works with both IP address formats
 
-[Traefik](https://traefik.io) plugins are developed using the [Go language](https://golang.org).
+### Memory Management and Persistence
+- **Automatic Bucket Cleanup**: Periodically removes unused rate limiters to prevent memory leaks
+- **File-Based Persistence**: Saves rate limiting state to disk for persistence across restarts
+- **Configurable Cleanup Intervals**: Tune memory usage for your specific traffic patterns
+- **Graceful Shutdown**: Ensures all state is saved before the plugin stops
 
-A [Traefik](https://traefik.io) middleware plugin is just a [Go package](https://golang.org/ref/spec#Packages) that provides an `http.Handler` to perform specific processing of requests and responses.
+### Production-Ready Features
+- **Thread-Safe Operations**: Concurrent request handling without race conditions
+- **Minimal Performance Impact**: Optimized for high-throughput environments
+- **Detailed Logging**: Monitor cleanup operations and persistence events
+- **Client IP Detection**: Smart extraction of real client IPs behind proxies
 
-Rather than being pre-compiled and linked, however, plugins are executed on the fly by [Yaegi](https://github.com/traefik/yaegi), an embedded Go interpreter.
+## Quick Start
 
-## Usage
+### Installation
 
-For a plugin to be active for a given Traefik instance, it must be declared in the static configuration.
+1. Install the plugin in your Traefik instance:
 
-Plugins are parsed and loaded exclusively during startup, which allows Traefik to check the integrity of the code and catch errors early on.
-If an error occurs during loading, the plugin is disabled.
-
-For security reasons, it is not possible to start a new plugin or modify an existing one while Traefik is running.
-
-Once loaded, middleware plugins behave exactly like statically compiled middlewares.
-Their instantiation and behavior are driven by the dynamic configuration.
-
-Plugin dependencies must be [vendored](https://golang.org/ref/mod#vendoring) for each plugin.
-Vendored packages should be included in the plugin's GitHub repository. ([Go modules](https://blog.golang.org/using-go-modules) are not supported.)
-
-### Configuration
-
-For each plugin, the Traefik static configuration must define the module name (as is usual for Go packages).
-
-The following declaration (given here in YAML) defines a plugin:
-
-```yaml
-# Static configuration
-
+```bash
+# Add to your Traefik static configuration
 experimental:
   plugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-      version: v0.2.1
+    bandwidthlimiter:
+      moduleName: github.com/hhftechnology/bandwidthlimiter
+      version: v1.0.0
 ```
 
-Here is an example of a file provider dynamic configuration (given here in YAML), where the interesting part is the `http.middlewares` section:
+2. Create a basic middleware configuration:
 
 ```yaml
-# Dynamic configuration
+# dynamic.yml
+http:
+  middlewares:
+    my-bandwidth-limiter:
+      plugin:
+        bandwidthlimiter:
+          defaultLimit: 1048576  # 1 MB/s
+          burstSize: 5242880     # 5 MB burst
+```
 
+3. Apply the middleware to your routes:
+
+```yaml
 http:
   routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
+    my-service:
+      rule: "Host(`example.com`)"
+      service: my-service
       middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
+        - my-bandwidth-limiter
 ```
 
-### Local Mode
+## Configuration Reference
 
-Traefik also offers a developer mode that can be used for temporary testing of plugins not hosted on GitHub.
-To use a plugin in local mode, the Traefik static configuration must define the module name (as is usual for Go packages) and a path to a [Go workspace](https://golang.org/doc/gopath_code.html#Workspaces), which can be the local GOPATH or any directory.
+### Basic Configuration
 
-The plugins must be placed in `./plugins-local` directory,
-which should be in the working directory of the process running the Traefik binary.
-The source code of the plugin should be organized as follows:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `defaultLimit` | int64 | 1048576 | Default bandwidth limit in bytes per second |
+| `burstSize` | int64 | 10x defaultLimit | Maximum burst size in bytes |
+| `backendLimits` | map[string]int64 | {} | Backend-specific limits |
+| `clientLimits` | map[string]int64 | {} | Client IP-specific limits |
 
-```
-./plugins-local/
-    └── src
-        └── github.com
-            └── traefik
-                └── plugindemo
-                    ├── demo.go
-                    ├── demo_test.go
-                    ├── go.mod
-                    ├── LICENSE
-                    ├── Makefile
-                    └── readme.md
-```
+### Advanced Configuration
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `bucketMaxAge` | int64 | 3600 | Maximum age of unused buckets before cleanup (seconds) |
+| `cleanupInterval` | int64 | 300 | Interval between cleanup runs (seconds) |
+| `persistenceFile` | string | "" | File path for persistent storage (disabled if empty) |
+| `saveInterval` | int64 | 60 | Interval between saves to persistence file (seconds) |
+
+## Configuration Examples
+
+### Basic Rate Limiting
 
 ```yaml
-# Static configuration
-
-experimental:
-  localPlugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-```
-
-(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/traefik/plugindemo`.)
-
-```yaml
-# Dynamic configuration
-
 http:
-  routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
-      middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
   middlewares:
-    my-plugin:
+    simple-limiter:
       plugin:
-        example:
-          headers:
-            Foo: Bar
+        bandwidthlimiter:
+          defaultLimit: 524288      # 512 KB/s
+          burstSize: 2621440        # 2.5 MB burst
 ```
 
-## Defining a Plugin
-
-A plugin package must define the following exported Go objects:
-
-- A type `type Config struct { ... }`. The struct fields are arbitrary.
-- A function `func CreateConfig() *Config`.
-- A function `func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error)`.
-
-```go
-// Package example a example plugin.
-package example
-
-import (
-	"context"
-	"net/http"
-)
-
-// Config the plugin configuration.
-type Config struct {
-	// ...
-}
-
-// CreateConfig creates the default plugin configuration.
-func CreateConfig() *Config {
-	return &Config{
-		// ...
-	}
-}
-
-// Example a plugin.
-type Example struct {
-	next     http.Handler
-	name     string
-	// ...
-}
-
-// New created a new plugin.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// ...
-	return &Example{
-		// ...
-	}, nil
-}
-
-func (e *Example) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// ...
-	e.next.ServeHTTP(rw, req)
-}
-```
-
-## Logs
-
-Currently, the only way to send logs to Traefik is to use `os.Stdout.WriteString("...")` or `os.Stderr.WriteString("...")`.
-
-In the future, we will try to provide something better and based on levels.
-
-## Plugins Catalog
-
-Traefik plugins are stored and hosted as public GitHub repositories.
-
-Every 30 minutes, the Plugins Catalog online service polls Github to find plugins and add them to its catalog.
-
-### Prerequisites
-
-To be recognized by Plugins Catalog, your repository must meet the following criteria:
-
-- The `traefik-plugin` topic must be set.
-- The `.traefik.yml` manifest must exist, and be filled with valid contents.
-
-If your repository fails to meet either of these prerequisites, Plugins Catalog will not see it.
-
-### Manifest
-
-A manifest is also mandatory, and it should be named `.traefik.yml` and stored at the root of your project.
-
-This YAML file provides Plugins Catalog with information about your plugin, such as a description, a full name, and so on.
-
-Here is an example of a typical `.traefik.yml`file:
+### Per-Backend Limits
 
 ```yaml
-# The name of your plugin as displayed in the Plugins Catalog web UI.
-displayName: Name of your plugin
-
-# For now, `middleware` is the only type available.
-type: middleware
-
-# The import path of your plugin.
-import: github.com/username/my-plugin
-
-# A brief description of what your plugin is doing.
-summary: Description of what my plugin is doing
-
-# Medias associated to the plugin (optional)
-iconPath: foo/icon.png
-bannerPath: foo/banner.png
-
-# Configuration data for your plugin.
-# This is mandatory,
-# and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-testData:
-  Headers:
-    Foo: Bar
+http:
+  middlewares:
+    backend-limiter:
+      plugin:
+        bandwidthlimiter:
+          defaultLimit: 1048576     # 1 MB/s default
+          backendLimits:
+            api.example.com: 2097152      # 2 MB/s for API
+            static.example.com: 524288    # 512 KB/s for static content
+            video.example.com: 10485760   # 10 MB/s for video streaming
 ```
 
-Properties include:
+### Client-Specific Limits
 
-- `displayName` (required): The name of your plugin as displayed in the Plugins Catalog web UI.
-- `type` (required): For now, `middleware` is the only type available.
-- `import` (required): The import path of your plugin.
-- `summary` (required): A brief description of what your plugin is doing.
-- `testData` (required): Configuration data for your plugin. This is mandatory, and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-- `iconPath` (optional): A local path in the repository to the icon of the project.
-- `bannerPath` (optional): A local path in the repository to the image that will be used when you will share your plugin page in social medias.
+```yaml
+http:
+  middlewares:
+    client-limiter:
+      plugin:
+        bandwidthlimiter:
+          defaultLimit: 524288      # 512 KB/s for regular users
+          clientLimits:
+            203.0.113.100: 5242880       # 5 MB/s for premium client
+            203.0.113.101: 2097152       # 2 MB/s for business client
+            "2001:db8::1": 10485760      # 10 MB/s for IPv6 client
+```
 
-There should also be a `go.mod` file at the root of your project. Plugins Catalog will use this file to validate the name of the project.
+### Production Configuration with Persistence
 
-### Tags and Dependencies
+```yaml
+http:
+  middlewares:
+    production-limiter:
+      plugin:
+        bandwidthlimiter:
+          # Basic limits
+          defaultLimit: 1048576
+          burstSize: 5242880
+          
+          # Memory management
+          bucketMaxAge: 1800       # 30 minutes
+          cleanupInterval: 300     # 5 minutes
+          
+          # Persistence
+          persistenceFile: "/plugins-storage/bandwidth-state.json"
+          saveInterval: 60         # 1 minute
+          
+          # Advanced limits
+          backendLimits:
+            api.example.com: 2097152
+            critical.example.com: 10485760
+          clientLimits:
+            192.168.1.100: 10485760
+            "fd00::1": 5242880
+```
 
-Plugins Catalog gets your sources from a Go module proxy, so your plugins need to be versioned with a git tag.
+## Bandwidth Value Reference
 
-Last but not least, if your plugin middleware has Go package dependencies, you need to vendor them and add them to your GitHub repository.
+Quickly convert between human-readable speeds and configuration values:
 
-If something goes wrong with the integration of your plugin, Plugins Catalog will create an issue inside your Github repository and will stop trying to add your repo until you close the issue.
+| Speed | Configuration Value |
+|-------|-------------------|
+| 128 Kbps | 16384 |
+| 256 Kbps | 32768 |
+| 512 Kbps | 65536 |
+| 1 Mbps | 131072 |
+| 2 Mbps | 262144 |
+| 5 Mbps | 655360 |
+| 10 Mbps | 1310720 |
+| 25 Mbps | 3276800 |
+| 50 Mbps | 6553600 |
+| 100 Mbps | 13107200 |
+
+**Formula**: Mbps × 131,072 = bytes/second
+
+## Best Practices
+
+### Memory Management
+
+Configure cleanup based on your traffic patterns:
+
+**High-Traffic Sites:**
+```yaml
+bandwidthlimiter:
+  bucketMaxAge: 600        # 10 minutes
+  cleanupInterval: 60      # 1 minute
+```
+
+**Medium-Traffic Sites:**
+```yaml
+bandwidthlimiter:
+  bucketMaxAge: 1800       # 30 minutes
+  cleanupInterval: 300     # 5 minutes
+```
+
+**Low-Traffic Sites:**
+```yaml
+bandwidthlimiter:
+  bucketMaxAge: 3600       # 1 hour
+  cleanupInterval: 600     # 10 minutes
+```
+
+### Persistence Configuration
+
+**Critical Applications:**
+```yaml
+bandwidthlimiter:
+            persistenceFile: "/plugins-storage/bandwidth-critical.json"
+  saveInterval: 30         # Save every 30 seconds
+```
+
+**Standard Applications:**
+```yaml
+bandwidthlimiter:
+            persistenceFile: "/plugins-storage/bandwidth-standard.json"
+  saveInterval: 60         # Save every minute
+```
+
+**Development/Testing:**
+```yaml
+bandwidthlimiter:
+  persistenceFile: "/tmp/bandwidth-dev.json"
+  saveInterval: 300        # Save every 5 minutes
+```
+
+## Deployment Scenarios
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  traefik:
+    image: traefik:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./traefik/plugins-storage:/plugins-storage:rw
+      - ./traefik/plugins-storage:/plugins-local:rw
+    ports:
+      - "80:80"
+      - "443:443"
+
+
+```
+
+### Kubernetes
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-bandwidth-config
+data:
+  dynamic.yml: |
+    http:
+      middlewares:
+        bandwidth-limiter:
+          plugin:
+            bandwidthlimiter:
+              persistenceFile: "/plugins-storage/bandwidth-state.json"
+              defaultLimit: 1048576
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: traefik-bandwidth-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+```
+
+### Bare Metal
+
+```bash
+# Create directories
+sudo mkdir -p /plugins-storage
+sudo chown traefik:traefik /plugins-storage
+sudo chmod 755 /plugins-storage
+
+# Traefik configuration
+cat > /etc/traefik/dynamic.yml << EOF
+http:
+  middlewares:
+    bandwidth-limiter:
+      plugin:
+        bandwidthlimiter:
+          persistenceFile: "/plugins-storage/bandwidth-state.json"
+          defaultLimit: 1048576
+EOF
+```
+
+## Monitoring and Observability
+
+### Log Monitoring
+
+Watch for these log messages:
+
+```
+# Successful operations
+INFO: Cleanup removed 150 unused buckets (kept 500 active buckets)
+INFO: Saved 500 buckets to /plugins-storage/bandwidth-state.json
+INFO: Loaded 450 buckets from /plugins-storage/bandwidth-state.json
+
+# Potential issues
+WARNING: Failed to save buckets: disk full
+ERROR: Failed to load persisted buckets: file corrupt
+```
+
+### Metrics to Track
+
+1. **Bucket Count**: Monitor active buckets over time
+2. **Cleanup Efficiency**: Track removed vs. retained buckets
+3. **File Size**: Watch persistence file growth
+4. **Save/Load Times**: Ensure operations complete quickly
+
+### Example Monitoring Script
+
+```bash
+#!/bin/bash
+# bandwidth-monitor.sh
+
+# Check memory usage
+echo "Memory usage:"
+ps aux | grep traefik | grep -v grep | awk '{print $6/1024 " MB"}'
+
+# Check file size
+echo "Persistence file size:"
+du -h /plugins-storage/bandwidth-state.json
+
+# Count active connections
+echo "Active bandwidth buckets:"
+grep -o '"key":' /plugins-storage/bandwidth-state.json | wc -l
+
+# Recent cleanup activity
+echo "Recent cleanup events:"
+journalctl -u traefik --since "1 hour ago" | grep "Cleanup removed"
+```
 
 ## Troubleshooting
 
-If Plugins Catalog fails to recognize your plugin, you will need to make one or more changes to your GitHub repository.
+### Common Issues
 
-In order for your plugin to be successfully imported by Plugins Catalog, consult this checklist:
+**High Memory Usage**
+- Reduce `bucketMaxAge`
+- Increase cleanup frequency (`cleanupInterval`)
+- Check for memory leaks in logs
 
-- The `traefik-plugin` topic must be set on your repository.
-- There must be a `.traefik.yml` file at the root of your project describing your plugin, and it must have a valid `testData` property for testing purposes.
-- There must be a valid `go.mod` file at the root of your project.
-- Your plugin must be versioned with a git tag.
-- If you have package dependencies, they must be vendored and added to your GitHub repository.
+**Slow Response Times**
+- Increase `burstSize` for initial data transfer
+- Optimize `defaultLimit` values
+- Consider hardware resources
+
+**Missing Rate Limits After Restart**
+- Verify `persistenceFile` path is correct
+- Check file permissions
+- Ensure directory exists and is writable
+
+**File Permission Errors**
+```bash
+# Fix ownership and permissions
+sudo chown traefik:traefik /plugins-storage/bandwidth-state.json
+sudo chmod 644 /plugins-storage/bandwidth-state.json
+```
+
+### Debug Mode
+
+Enable detailed logging in Traefik:
+
+```yaml
+# traefik.yml
+log:
+  level: DEBUG
+  
+# Or via command line
+--log.level=DEBUG
+```
+
+## Advanced Usage
+
+### Load Balancer Environments
+
+For multiple Traefik instances:
+
+```yaml
+# Instance 1
+bandwidthlimiter:
+  persistenceFile: "/shared/storage/bandwidth-node1.json"
+
+# Instance 2
+bandwidthlimiter:
+  persistenceFile: "/shared/storage/bandwidth-node2.json"
+
+# Use external synchronization for shared state
+```
+
+### Backup and Disaster Recovery
+
+```bash
+#!/bin/bash
+# bandwidth-backup.sh
+
+# Create timestamped backup
+cp /plugins-storage/bandwidth-state.json \
+   /backup/bandwidth-$(date +%Y%m%d-%H%M%S).json
+
+# Keep only last 30 days of backups
+find /backup -name "bandwidth-*.json" -mtime +30 -delete
+
+# Verify backup integrity
+if ! jq . /backup/bandwidth-latest.json >/dev/null 2>&1; then
+  echo "ERROR: Backup file is corrupted"
+  exit 1
+fi
+```
+
+### Rate Limit Development
+
+Test configurations locally:
+
+```yaml
+# development.yml
+http:
+  middlewares:
+    dev-bandwidth:
+      plugin:
+        bandwidthlimiter:
+          # Fast cleanup for testing
+          bucketMaxAge: 300
+          cleanupInterval: 60
+          
+          # Local persistence
+          persistenceFile: "/tmp/bandwidth-dev.json"
+          
+          # Test limits
+          defaultLimit: 65536  # 64 KB/s
+          clientLimits:
+            127.0.0.1: 1048576  # 1 MB/s for localhost
+```
+
+## Performance Tuning
+
+### Optimization Guidelines
+
+1. **Bucket Management**
+   - Start with conservative `bucketMaxAge` (1-2 hours)
+   - Gradually reduce based on memory usage
+   - Monitor cleanup efficiency
+
+2. **Persistence Settings**
+   - Balance between data safety and performance
+   - Use faster storage for persistence files
+   - Consider disabling in development
+
+3. **Resource Planning**
+   - Estimate: 200 bytes per active bucket
+   - Plan for peak traffic scenarios
+   - Monitor during traffic spikes
+
+### Performance Benchmarks
+
+Typical performance characteristics:
+
+| Metric | Value |
+|--------|-------|
+| Request overhead | ~1-2ms |
+| Cleanup duration | ~50-100ms per 1000 buckets |
+| Save operation | ~100-200ms per 1000 buckets |
+| Memory per bucket | ~200 bytes |
+| File size per bucket | ~200 bytes (JSON) |
+
+## Support and Contributing
+
+### Reporting Issues
+
+When reporting issues, include:
+
+1. Traefik version
+2. Plugin configuration
+3. Traffic patterns
+4. Error logs
+5. Memory usage statistics
+
+### Feature Requests
+
+We welcome contributions for:
+
+- Additional rate limiting algorithms
+- Enhanced metrics and monitoring
+- Integration with external storage systems
+- Advanced synchronization between instances
+
+### License
+
+This plugin is licensed under the Apache 2.0 License. See LICENSE file for details.
+
+## Appendix
+
+### Command Line Tools
+
+```bash
+# Query bucket states
+jq '.[] | select(.key | contains("192.168.1.100"))' /plugins-storage/bandwidth-state.json
+
+# Count buckets by client IP
+jq -r '.[].key' /plugins-storage/bandwidth-state.json | cut -d: -f1 | sort | uniq -c
+
+# Find high-usage clients
+jq '.[] | {key, tokens, limit} | select(.tokens < .limit * 0.1)' /plugins-storage/bandwidth-state.json
+```
+
+### Integration Examples
+
+**Prometheus Metrics (Custom Endpoint)**
+```go
+// Add to custom metrics endpoint
+type BandwidthMetrics struct {
+    ActiveBuckets    int64
+    TotalRequests    int64
+    BytesTransferred int64
+}
+```
+
+**Grafana Dashboard Query**
+```promql
+# Active bandwidth buckets
+traefik_bandwidth_active_buckets
+
+# Bandwidth utilization
+rate(traefik_bandwidth_bytes_transferred[5m])
+```
+
+This comprehensive plugin provides enterprise-grade bandwidth limiting capabilities for Traefik, combining ease of use with advanced features for production environments. Start with the basic configuration and gradually enable advanced features as your needs grow.

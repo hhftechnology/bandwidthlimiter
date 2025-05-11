@@ -1,12 +1,16 @@
-displayName: Demo Plugin
+displayName: Bandwidth Limiter
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/traefik/plugindemo
+import: github.com/hhftechnology/bandwidthlimiter
 
-summary: '[Demo] Add Request Header'
+summary: 'Bandwidth limiting middleware with per-backend and per-client IP support'
 
 testData:
-  Headers:
-    X-Demo: test
-    X-URL: '{{URL}}'
+  defaultLimit: 1048576  # 1 MB/s
+  burstSize: 10485760    # 10 MB
+  backendLimits:
+    api.example.com: 2097152    # 2 MB/s for API backend
+    static.example.com: 524288  # 512 KB/s for static content
+  clientLimits:
+    192.168.1.100: 5242880      # 5 MB/s for specific client
