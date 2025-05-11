@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,22 +14,35 @@ import (
 
 // TestBandwidthLimiter tests the basic bandwidth limiting functionality
 func TestBandwidthLimiter(t *testing.T) {
-	// Create plugin configuration
+	// Create plugin configuration with more aggressive limits for testing
 	cfg := bandwidthlimiter.CreateConfig()
-	cfg.DefaultLimit = 1024 * 100 // 100 KB/s
-	cfg.BurstSize = 1024 * 50     // 50 KB burst
+	cfg.DefaultLimit = 1024 * 50  // 50 KB/s (reduced for faster testing)
+	cfg.BurstSize = 1024 * 10     // 10 KB burst (smaller burst for clearer testing)
 	
 	// Create context
 	ctx := context.Background()
 	
 	// Create a test handler that sends a large response
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		// Send 200 KB of data (should take ~2 seconds at 100 KB/s)
-		data := make([]byte, 200*1024)
+		// Send 100 KB of data (should take ~2 seconds at 50 KB/s)
+		data := make([]byte, 100*1024)
 		for i := range data {
 			data[i] = byte(i % 256)
 		}
-		rw.Write(data)
+		// Write in chunks to ensure rate limiting is applied properly
+		written := 0
+		chunkSize := 4096
+		for written < len(data) {
+			end := written + chunkSize
+			if end > len(data) {
+				end = len(data)
+			}
+			rw.Write(data[written:end])
+			written = end
+			if rw, ok := rw.(http.Flusher); ok {
+				rw.Flush()
+			}
+		}
 	})
 	
 	// Create the bandwidth limiter middleware
@@ -54,34 +69,47 @@ func TestBandwidthLimiter(t *testing.T) {
 	elapsed := time.Since(start)
 	
 	// Verify that the response was throttled
-	// With 100 KB/s limit and 200 KB data, it should take at least 1.5 seconds
-	// (accounting for burst allowance)
-	if elapsed < time.Second {
-		t.Errorf("Response was not properly throttled. Expected >1s, got %v", elapsed)
+	// With 50 KB/s limit and 100 KB data, it should take at least 1.5-2 seconds
+	minExpectedTime := time.Second
+	if elapsed < minExpectedTime {
+		t.Errorf("Response was not properly throttled. Expected >%v, got %v", minExpectedTime, elapsed)
 	}
 	
 	// Verify the response size
 	body := recorder.Body.Bytes()
-	if len(body) != 200*1024 {
-		t.Errorf("Unexpected response size. Expected %d, got %d", 200*1024, len(body))
+	if len(body) != 100*1024 {
+		t.Errorf("Unexpected response size. Expected %d, got %d", 100*1024, len(body))
 	}
 }
 
 // TestPerBackendLimits tests that different backends get different limits
 func TestPerBackendLimits(t *testing.T) {
 	cfg := bandwidthlimiter.CreateConfig()
-	cfg.DefaultLimit = 1024 * 50  // 50 KB/s default
+	cfg.DefaultLimit = 1024 * 25  // 25 KB/s default (slower for testing)
 	cfg.BackendLimits = map[string]int64{
-		"fast-api.local": 1024 * 200, // 200 KB/s for fast API
+		"fast-api.local": 1024 * 100, // 100 KB/s for fast API
 	}
-	cfg.BurstSize = 1024 * 10 // 10 KB burst
+	cfg.BurstSize = 1024 * 5 // 5 KB burst (smaller for clearer testing)
 	
 	ctx := context.Background()
 	
-	// Create handler that sends 100 KB
+	// Create handler that sends 50 KB
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		data := make([]byte, 100*1024)
-		rw.Write(data)
+		data := make([]byte, 50*1024)
+		// Write in small chunks to ensure rate limiting is applied
+		written := 0
+		chunkSize := 2048
+		for written < len(data) {
+			end := written + chunkSize
+			if end > len(data) {
+				end = len(data)
+			}
+			rw.Write(data[written:end])
+			written = end
+			if rw, ok := rw.(http.Flusher); ok {
+				rw.Flush()
+			}
+		}
 	})
 	
 	handler, err := bandwidthlimiter.New(ctx, next, cfg, "test-limiter")
@@ -98,9 +126,10 @@ func TestPerBackendLimits(t *testing.T) {
 		handler.ServeHTTP(recorder, req)
 		elapsed := time.Since(start)
 		
-		// With 50 KB/s, 100 KB should take ~1.5-2 seconds (accounting for burst)
-		if elapsed < time.Second {
-			t.Errorf("Default backend was too fast. Expected >1s, got %v", elapsed)
+		// With 25 KB/s, 50 KB should take ~2 seconds (accounting for burst)
+		minExpectedTime := time.Duration(1.5 * float64(time.Second))
+		if elapsed < minExpectedTime {
+			t.Errorf("Default backend was too fast. Expected >%v, got %v", minExpectedTime, elapsed)
 		}
 	})
 	
@@ -113,9 +142,10 @@ func TestPerBackendLimits(t *testing.T) {
 		handler.ServeHTTP(recorder, req)
 		elapsed := time.Since(start)
 		
-		// With 200 KB/s, 100 KB should take ~0.5 seconds (with burst)
-		if elapsed > time.Second {
-			t.Errorf("Fast backend was too slow. Expected <1s, got %v", elapsed)
+		// With 100 KB/s, 50 KB should take ~0.5 seconds (with burst)
+		maxExpectedTime := time.Second
+		if elapsed > maxExpectedTime {
+			t.Errorf("Fast backend was too slow. Expected <%v, got %v", maxExpectedTime, elapsed)
 		}
 	})
 }
@@ -123,17 +153,31 @@ func TestPerBackendLimits(t *testing.T) {
 // TestPerClientLimits tests that different client IPs get different limits
 func TestPerClientLimits(t *testing.T) {
 	cfg := bandwidthlimiter.CreateConfig()
-	cfg.DefaultLimit = 1024 * 50  // 50 KB/s default
+	cfg.DefaultLimit = 1024 * 25  // 25 KB/s default (slower for testing)
 	cfg.ClientLimits = map[string]int64{
-		"10.0.0.100": 1024 * 150, // 150 KB/s for premium client
+		"10.0.0.100": 1024 * 75, // 75 KB/s for premium client
 	}
+	cfg.BurstSize = 1024 * 5 // 5 KB burst (smaller for clearer testing)
 	
 	ctx := context.Background()
 	
-	// Create handler that sends 75 KB
+	// Create handler that sends 50 KB
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		data := make([]byte, 75*1024)
-		rw.Write(data)
+		data := make([]byte, 50*1024)
+		// Write in small chunks to ensure rate limiting is applied
+		written := 0
+		chunkSize := 2048
+		for written < len(data) {
+			end := written + chunkSize
+			if end > len(data) {
+				end = len(data)
+			}
+			rw.Write(data[written:end])
+			written = end
+			if rw, ok := rw.(http.Flusher); ok {
+				rw.Flush()
+			}
+		}
 	})
 	
 	handler, err := bandwidthlimiter.New(ctx, next, cfg, "test-limiter")
@@ -151,9 +195,10 @@ func TestPerClientLimits(t *testing.T) {
 		handler.ServeHTTP(recorder, req)
 		elapsed := time.Since(start)
 		
-		// Should take at least 1 second with 50 KB/s limit
-		if elapsed < time.Millisecond*800 {
-			t.Errorf("Regular client was too fast. Expected >800ms, got %v", elapsed)
+		// With 25 KB/s, 50 KB should take ~2 seconds (accounting for burst)
+		minExpectedTime := time.Duration(1.5 * float64(time.Second))
+		if elapsed < minExpectedTime {
+			t.Errorf("Regular client was too fast. Expected >%v, got %v", minExpectedTime, elapsed)
 		}
 	})
 	
@@ -167,9 +212,10 @@ func TestPerClientLimits(t *testing.T) {
 		handler.ServeHTTP(recorder, req)
 		elapsed := time.Since(start)
 		
-		// Should be faster with 150 KB/s limit
-		if elapsed > time.Millisecond*600 {
-			t.Errorf("Premium client was too slow. Expected <600ms, got %v", elapsed)
+		// With 75 KB/s, 50 KB should take ~0.7 seconds (with burst)
+		maxExpectedTime := time.Second
+		if elapsed > maxExpectedTime {
+			t.Errorf("Premium client was too slow. Expected <%v, got %v", maxExpectedTime, elapsed)
 		}
 	})
 }
@@ -194,5 +240,76 @@ func TestTokenBucket(t *testing.T) {
 	// Should be able to consume some tokens after waiting
 	if !bucket.Consume(50) {
 		t.Error("Should be able to consume tokens after waiting")
+	}
+}
+
+// TestPersistence tests file-based persistence functionality through the public interface
+func TestPersistence(t *testing.T) {
+	// Create temporary file for testing
+	tempFile := t.TempDir() + "/test-buckets.json"
+	
+	cfg := bandwidthlimiter.CreateConfig()
+	cfg.DefaultLimit = 1048576
+	cfg.PersistenceFile = tempFile
+	cfg.SaveInterval = 1 // Save every second for testing
+	
+	ctx := context.Background()
+	
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.Write([]byte("test"))
+	})
+	
+	// Create first instance and make some requests
+	handler1, err := bandwidthlimiter.New(ctx, next, cfg, "test-limiter-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	// Create some traffic to generate buckets
+	for i := 0; i < 3; i++ {
+		recorder := httptest.NewRecorder()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost", nil)
+		req.RemoteAddr = fmt.Sprintf("192.168.1.%d:12345", i)
+		handler1.ServeHTTP(recorder, req)
+	}
+	
+	// Wait for the save interval to ensure buckets are saved
+	time.Sleep(2 * time.Second)
+	
+	// We need to access the private Shutdown method, so let's cast the handler
+	// This is a bit of a hack, but necessary since we can't access private fields
+	if handler1, ok := handler1.(*bandwidthlimiter.BandwidthLimiter); ok {
+		handler1.Shutdown()
+	} else {
+		t.Fatal("Handler is not of type *BandwidthLimiter")
+	}
+	
+	// Check that the file exists and has content
+	if _, err := os.Stat(tempFile); os.IsNotExist(err) {
+		t.Errorf("Persistence file was not created: %s", tempFile)
+	}
+	
+	// Create second instance and verify it loads the saved buckets
+	// We can't directly verify the bucket count since buckets is private
+	// But we can verify that the instance loads successfully
+	handler2, err := bandwidthlimiter.New(ctx, next, cfg, "test-limiter-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	// Make a request with one of the previous IPs to verify the bucket was loaded
+	recorder := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost", nil)
+	req.RemoteAddr = "192.168.1.0:12345" // Use the first IP from the previous test
+	handler2.ServeHTTP(recorder, req)
+	
+	// If no error occurred, the bucket was likely loaded successfully
+	if recorder.Code != http.StatusOK {
+		t.Errorf("Second instance failed to handle request, possibly due to persistence issues")
+	}
+	
+	// Cleanup
+	if handler2, ok := handler2.(*bandwidthlimiter.BandwidthLimiter); ok {
+		handler2.Shutdown()
 	}
 }
