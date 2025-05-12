@@ -1,6 +1,24 @@
-# Bandwidth Limiter Plugin for Traefik
+<div align="center" width="100%">
+    <h1>Bandwidth Limiter Plugin for Traefik
+</h1>
+    <img width="auto" src=".assets/banner.png">
+    <a target="_blank" href="https://GitHub.com/hhftechnology/bandwidthlimiter/graphs/contributors/"><img src="https://img.shields.io/github/contributors/hhftechnology/bandwidthlimiter.svg" /></a><br>
+    <a target="_blank" href="https://GitHub.com/hhftechnology/bandwidthlimiter/commits/"><img src="https://img.shields.io/github/last-commit/hhftechnology/bandwidthlimiter.svg" /></a>
+    <a target="_blank" href="https://GitHub.com/hhftechnology/bandwidthlimiter/issues/"><img src="https://img.shields.io/github/issues/hhftechnology/bandwidthlimiter.svg" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/bandwidthlimiter/issues?q=is%3Aissue+is%3Aclosed"><img src="https://img.shields.io/github/issues-closed/hhftechnology/bandwidthlimiter.svg" /></a><br>
+        <a target="_blank" href="https://github.com/hhftechnology/bandwidthlimiter/stargazers"><img src="https://img.shields.io/github/stars/hhftechnology/bandwidthlimiter.svg?style=social&label=Star" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/bandwidthlimiter/network/members"><img src="https://img.shields.io/github/forks/hhftechnology/bandwidthlimiter.svg?style=social&label=Fork" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/bandwidthlimiter/watchers"><img src="https://img.shields.io/github/watchers/hhftechnology/bandwidthlimiter.svg?style=social&label=Watch" /></a><br>
+</div>
 
- bandwidth limiting middleware plugin for Traefik that provides fine-grained control over data transfer rates. This plugin supports per-backend and per-client IP rate limiting with automatic memory management and persistent state storage.
+<div align="center" width="100%">
+    <p>Bandwidth limiting middleware plugin for Traefik that provides fine-grained control over data transfer rates. This plugin supports per-backend and per-client IP rate limiting with automatic memory management and persistent state storage.</p>
+    <a target="_blank" href="https://github.com/hhftechnology/bandwidthlimiter"><img src="https://img.shields.io/badge/maintainer-hhftechnology-orange" /></a>
+</div>
+
+## 📝 Forums
+
+[See the forums for further discussion here](https://forum.hhf.technology/)
 
 ## Features
 
