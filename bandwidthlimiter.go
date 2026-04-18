@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -14,32 +15,34 @@ import (
 	"time"
 )
 
+const CHUNK_SIZE = 4096 //4KB
+
 // Config holds the plugin configuration
 type Config struct {
-	// Default bandwidth limit in bytes per second
+	// Default bandwidth limit in bytes per second (for both uploads and downloads)
 	DefaultLimit int64 `json:"defaultLimit"`
-	
+
 	// Backend-specific limits: map[backend-address]limit
 	BackendLimits map[string]int64 `json:"backendLimits,omitempty"`
-	
+
 	// Client IP-specific limits: map[client-ip]limit
 	ClientLimits map[string]int64 `json:"clientLimits,omitempty"`
-	
-	// Burst size - how many bytes can be sent in a single burst
+
+	// Burst size - how many bytes can be transferred in a single burst
 	BurstSize int64 `json:"burstSize,omitempty"`
-	
+
 	// Maximum age of unused buckets before cleanup (in seconds)
 	// Default: 3600 (1 hour)
 	BucketMaxAge int64 `json:"bucketMaxAge,omitempty"`
-	
+
 	// Cleanup interval in seconds
 	// Default: 300 (5 minutes)
 	CleanupInterval int64 `json:"cleanupInterval,omitempty"`
-	
+
 	// File path for persistent bucket storage
 	// If empty, no file storage is used
 	PersistenceFile string `json:"persistenceFile,omitempty"`
-	
+
 	// How often to save buckets to file (in seconds)
 	// Default: 60 (1 minute)
 	SaveInterval int64 `json:"saveInterval,omitempty"`
@@ -52,22 +55,23 @@ func CreateConfig() *Config {
 		BackendLimits:   make(map[string]int64),
 		ClientLimits:    make(map[string]int64),
 		BurstSize:       10 * 1024 * 1024, // 10 MB burst default
-		BucketMaxAge:    3600,  // 1 hour
-		CleanupInterval: 300,   // 5 minutes
-		SaveInterval:    60,    // 1 minute
+		BucketMaxAge:    3600,             // 1 hour
+		CleanupInterval: 300,              // 5 minutes
+		SaveInterval:    60,               // 1 minute
 	}
 }
 
 // BandwidthLimiter implements the middleware
 type BandwidthLimiter struct {
-	next            http.Handler
-	name            string
-	config          *Config
-	buckets         sync.Map         // map[string]*bucketWrapper
-	cleanupTicker   *time.Ticker
-	saveTicker      *time.Ticker
-	shutdownChan    chan struct{}
-	wg              sync.WaitGroup
+	next          http.Handler
+	name          string
+	config        *Config
+	buckets       sync.Map // map[string]*bucketWrapper for download limiting
+	uploadBuckets sync.Map // map[string]*bucketWrapper for upload limiting
+	cleanupTicker *time.Ticker
+	saveTicker    *time.Ticker
+	shutdownChan  chan struct{}
+	wg            sync.WaitGroup
 }
 
 // bucketWrapper wraps a TokenBucket with metadata for cleanup and persistence
@@ -89,6 +93,7 @@ type TokenBucket struct {
 // bucketState represents the serializable state of a bucket
 type bucketState struct {
 	Key        string    `json:"key"`
+	Type       string    `json:"type"` // "download" or "upload"
 	Tokens     int64     `json:"tokens"`
 	Limit      int64     `json:"limit"`
 	BurstSize  int64     `json:"burstSize"`
@@ -110,20 +115,22 @@ func NewTokenBucket(limit, burstSize int64) *TokenBucket {
 func (tb *TokenBucket) Consume(tokens int64) bool {
 	tb.mutex.Lock()
 	defer tb.mutex.Unlock()
-	
+
 	// Refill tokens based on time elapsed
 	now := time.Now()
 	elapsed := now.Sub(tb.lastRefill)
 	tokensToAdd := int64(elapsed.Seconds() * float64(tb.limit))
-	tb.tokens = min(tb.tokens+tokensToAdd, tb.burstSize)
-	tb.lastRefill = now
-	
+	if tokensToAdd > 0 {
+		tb.tokens = min(tb.tokens+tokensToAdd, tb.burstSize)
+		tb.lastRefill = now
+	}
+
 	// Check if we have enough tokens
 	if tb.tokens >= tokens {
 		tb.tokens -= tokens
 		return true
 	}
-	
+
 	// Not enough tokens, return false
 	return false
 }
@@ -132,7 +139,7 @@ func (tb *TokenBucket) Consume(tokens int64) bool {
 func (tb *TokenBucket) getState() bucketState {
 	tb.mutex.Lock()
 	defer tb.mutex.Unlock()
-	
+
 	return bucketState{
 		Tokens:     tb.tokens,
 		Limit:      tb.limit,
@@ -145,7 +152,7 @@ func (tb *TokenBucket) getState() bucketState {
 func (tb *TokenBucket) restoreFromState(state bucketState) {
 	tb.mutex.Lock()
 	defer tb.mutex.Unlock()
-	
+
 	tb.tokens = state.Tokens
 	tb.limit = state.Limit
 	tb.burstSize = state.BurstSize
@@ -165,30 +172,34 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if config.DefaultLimit <= 0 {
 		return nil, fmt.Errorf("defaultLimit must be greater than 0")
 	}
-	
+
 	if config.BurstSize == 0 {
 		config.BurstSize = config.DefaultLimit * 10 // Default burst is 10x the rate
 	}
-	
+
+	if config.BurstSize < CHUNK_SIZE {
+		return nil, fmt.Errorf("burstSize must be greater chunk size to avoid infinite loops")
+	}
+
 	if config.BucketMaxAge == 0 {
 		config.BucketMaxAge = 3600 // 1 hour default
 	}
-	
+
 	if config.CleanupInterval == 0 {
 		config.CleanupInterval = 300 // 5 minutes default
 	}
-	
+
 	if config.SaveInterval == 0 {
 		config.SaveInterval = 60 // 1 minute default
 	}
-	
+
 	bl := &BandwidthLimiter{
 		next:         next,
 		name:         name,
 		config:       config,
 		shutdownChan: make(chan struct{}),
 	}
-	
+
 	// Load persisted buckets if persistence is enabled
 	if config.PersistenceFile != "" {
 		if err := bl.loadBuckets(); err != nil {
@@ -196,26 +207,26 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			fmt.Printf("Warning: Failed to load persisted buckets: %v\n", err)
 		}
 	}
-	
+
 	// Start cleanup routine
 	bl.cleanupTicker = time.NewTicker(time.Duration(config.CleanupInterval) * time.Second)
 	bl.wg.Add(1)
 	go bl.cleanupRoutine()
-	
+
 	// Start save routine if persistence is enabled
 	if config.PersistenceFile != "" {
 		bl.saveTicker = time.NewTicker(time.Duration(config.SaveInterval) * time.Second)
 		bl.wg.Add(1)
 		go bl.saveRoutine()
 	}
-	
+
 	return bl, nil
 }
 
 // cleanupRoutine periodically removes unused buckets
 func (bl *BandwidthLimiter) cleanupRoutine() {
 	defer bl.wg.Done()
-	
+
 	for {
 		select {
 		case <-bl.cleanupTicker.C:
@@ -230,15 +241,19 @@ func (bl *BandwidthLimiter) cleanupRoutine() {
 func (bl *BandwidthLimiter) doCleanup() {
 	now := time.Now()
 	maxAge := time.Duration(bl.config.BucketMaxAge) * time.Second
-	
+
 	// Count buckets before cleanup
 	beforeCount := 0
 	bl.buckets.Range(func(key, value interface{}) bool {
 		beforeCount++
 		return true
 	})
-	
-	// Remove old buckets
+	bl.uploadBuckets.Range(func(key, value interface{}) bool {
+		beforeCount++
+		return true
+	})
+
+	// Remove old download buckets
 	bl.buckets.Range(func(key, value interface{}) bool {
 		wrapper := value.(*bucketWrapper)
 		if now.Sub(wrapper.lastUsed) > maxAge {
@@ -246,14 +261,27 @@ func (bl *BandwidthLimiter) doCleanup() {
 		}
 		return true
 	})
-	
+
+	// Remove old upload buckets
+	bl.uploadBuckets.Range(func(key, value interface{}) bool {
+		wrapper := value.(*bucketWrapper)
+		if now.Sub(wrapper.lastUsed) > maxAge {
+			bl.uploadBuckets.Delete(key)
+		}
+		return true
+	})
+
 	// Count buckets after cleanup
 	afterCount := 0
 	bl.buckets.Range(func(key, value interface{}) bool {
 		afterCount++
 		return true
 	})
-	
+	bl.uploadBuckets.Range(func(key, value interface{}) bool {
+		afterCount++
+		return true
+	})
+
 	removed := beforeCount - afterCount
 	if removed > 0 {
 		fmt.Printf("Cleanup removed %d unused buckets (kept %d active buckets)\n", removed, afterCount)
@@ -263,7 +291,7 @@ func (bl *BandwidthLimiter) doCleanup() {
 // saveRoutine periodically saves buckets to file
 func (bl *BandwidthLimiter) saveRoutine() {
 	defer bl.wg.Done()
-	
+
 	for {
 		select {
 		case <-bl.saveTicker.C:
@@ -285,25 +313,37 @@ func (bl *BandwidthLimiter) saveBuckets() error {
 	if bl.config.PersistenceFile == "" {
 		return nil // Persistence disabled
 	}
-	
+
 	var states []bucketState
-	
-	// Collect all bucket states
+
+	// Collect all download bucket states
 	bl.buckets.Range(func(key, value interface{}) bool {
 		wrapper := value.(*bucketWrapper)
 		state := wrapper.bucket.getState()
 		state.Key = key.(string)
+		state.Type = "download"
 		state.LastUsed = wrapper.lastUsed
 		states = append(states, state)
 		return true
 	})
-	
+
+	// Collect all upload bucket states
+	bl.uploadBuckets.Range(func(key, value interface{}) bool {
+		wrapper := value.(*bucketWrapper)
+		state := wrapper.bucket.getState()
+		state.Key = key.(string)
+		state.Type = "upload"
+		state.LastUsed = wrapper.lastUsed
+		states = append(states, state)
+		return true
+	})
+
 	// Create directory if it doesn't exist
 	dir := filepath.Dir(bl.config.PersistenceFile)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
-	
+
 	// Write to temporary file first (atomic save)
 	tempFile := bl.config.PersistenceFile + ".tmp"
 	file, err := os.Create(tempFile)
@@ -311,20 +351,22 @@ func (bl *BandwidthLimiter) saveBuckets() error {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer file.Close()
-	
+
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ") // Pretty print for debugging
 	if err := encoder.Encode(states); err != nil {
 		return fmt.Errorf("failed to encode buckets: %w", err)
 	}
-	
-	file.Close()
-	
+
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+
 	// Atomic rename
 	if err := os.Rename(tempFile, bl.config.PersistenceFile); err != nil {
 		return fmt.Errorf("failed to rename file: %w", err)
 	}
-	
+
 	fmt.Printf("Saved %d buckets to %s\n", len(states), bl.config.PersistenceFile)
 	return nil
 }
@@ -334,7 +376,7 @@ func (bl *BandwidthLimiter) loadBuckets() error {
 	if bl.config.PersistenceFile == "" {
 		return nil // Persistence disabled
 	}
-	
+
 	file, err := os.Open(bl.config.PersistenceFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -343,29 +385,35 @@ func (bl *BandwidthLimiter) loadBuckets() error {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
-	
+
 	var states []bucketState
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&states); err != nil {
 		return fmt.Errorf("failed to decode buckets: %w", err)
 	}
-	
+
 	// Restore buckets
 	loaded := 0
 	for _, state := range states {
 		bucket := NewTokenBucket(state.Limit, state.BurstSize)
 		bucket.restoreFromState(state)
-		
+
 		wrapper := &bucketWrapper{
 			bucket:   bucket,
 			lastUsed: state.LastUsed,
 			key:      state.Key,
 		}
-		
-		bl.buckets.Store(state.Key, wrapper)
+
+		// Store in appropriate map based on type
+		if state.Type == "upload" {
+			bl.uploadBuckets.Store(state.Key, wrapper)
+		} else {
+			// Default to download for backwards compatibility
+			bl.buckets.Store(state.Key, wrapper)
+		}
 		loaded++
 	}
-	
+
 	fmt.Printf("Loaded %d buckets from %s\n", loaded, bl.config.PersistenceFile)
 	return nil
 }
@@ -373,15 +421,15 @@ func (bl *BandwidthLimiter) loadBuckets() error {
 // Shutdown gracefully shuts down the bandwidth limiter
 func (bl *BandwidthLimiter) Shutdown() {
 	close(bl.shutdownChan)
-	
+
 	if bl.cleanupTicker != nil {
 		bl.cleanupTicker.Stop()
 	}
-	
+
 	if bl.saveTicker != nil {
 		bl.saveTicker.Stop()
 	}
-	
+
 	bl.wg.Wait()
 }
 
@@ -389,29 +437,40 @@ func (bl *BandwidthLimiter) Shutdown() {
 func (bl *BandwidthLimiter) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Extract client IP
 	clientIP := getClientIP(req)
-	
+
 	// Get backend address from request
 	backend := req.URL.Host
 	if backend == "" {
 		backend = "default"
 	}
-	
+
 	// Determine the bandwidth limit to apply
 	limit := bl.getLimit(clientIP, backend)
-	
-	// Create or get the token bucket for this client/backend combination
+
+	// Create key for this client/backend combination
 	key := fmt.Sprintf("%s:%s", clientIP, backend)
-	
-	// Get or create bucket with automatic update of last used time
-	wrapper := bl.getOrCreateBucket(key, limit)
-	wrapper.lastUsed = time.Now() // Update last used time
-	
-	// Wrap the response writer to monitor bandwidth
+
+	// Apply upload limiting if there's a request body
+	if req.Body != nil && req.ContentLength != 0 {
+		uploadWrapper := bl.getOrCreateUploadBucket(key, limit)
+		uploadWrapper.lastUsed = time.Now()
+
+		// Wrap the request body with rate limiting
+		req.Body = &limitedReadCloser{
+			ReadCloser: req.Body,
+			bucket:     uploadWrapper.bucket,
+		}
+	}
+
+	// Apply download limiting
+	downloadWrapper := bl.getOrCreateBucket(key, limit)
+	downloadWrapper.lastUsed = time.Now()
+
 	lrw := &limitedResponseWriter{
 		ResponseWriter: rw,
-		bucket:         wrapper.bucket,
+		bucket:         downloadWrapper.bucket,
 	}
-	
+
 	// Call the next handler
 	bl.next.ServeHTTP(lrw, req)
 }
@@ -421,7 +480,7 @@ func (bl *BandwidthLimiter) getOrCreateBucket(key string, limit int64) *bucketWr
 	if value, ok := bl.buckets.Load(key); ok {
 		return value.(*bucketWrapper)
 	}
-	
+
 	// Create new bucket
 	bucket := NewTokenBucket(limit, bl.config.BurstSize)
 	wrapper := &bucketWrapper{
@@ -429,9 +488,28 @@ func (bl *BandwidthLimiter) getOrCreateBucket(key string, limit int64) *bucketWr
 		lastUsed: time.Now(),
 		key:      key,
 	}
-	
+
 	// Store it (may overwrite if another goroutine created it first)
 	actual, _ := bl.buckets.LoadOrStore(key, wrapper)
+	return actual.(*bucketWrapper)
+}
+
+// getOrCreateUploadBucket gets an existing upload bucket or creates a new one
+func (bl *BandwidthLimiter) getOrCreateUploadBucket(key string, limit int64) *bucketWrapper {
+	if value, ok := bl.uploadBuckets.Load(key); ok {
+		return value.(*bucketWrapper)
+	}
+
+	// Create new bucket
+	bucket := NewTokenBucket(limit, bl.config.BurstSize)
+	wrapper := &bucketWrapper{
+		bucket:   bucket,
+		lastUsed: time.Now(),
+		key:      key,
+	}
+
+	// Store it (may overwrite if another goroutine created it first)
+	actual, _ := bl.uploadBuckets.LoadOrStore(key, wrapper)
 	return actual.(*bucketWrapper)
 }
 
@@ -441,12 +519,12 @@ func (bl *BandwidthLimiter) getLimit(clientIP, backend string) int64 {
 	if limit, exists := bl.config.ClientLimits[clientIP]; exists {
 		return limit
 	}
-	
+
 	// Check for backend-specific limit
 	if limit, exists := bl.config.BackendLimits[backend]; exists {
 		return limit
 	}
-	
+
 	// Return default limit
 	return bl.config.DefaultLimit
 }
@@ -460,12 +538,12 @@ func getClientIP(req *http.Request) string {
 			return ips[0]
 		}
 	}
-	
+
 	// Try to get IP from X-Real-IP header
 	if xri := req.Header.Get("X-Real-IP"); xri != "" {
 		return xri
 	}
-	
+
 	// Fall back to RemoteAddr
 	host, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
@@ -497,32 +575,54 @@ func (lrw *limitedResponseWriter) Write(p []byte) (int, error) {
 	// Track the total bytes written
 	totalWritten := 0
 	remaining := p
-	
+
 	for len(remaining) > 0 {
 		// Determine how many bytes to write in this iteration
-		chunkSize := min(int64(len(remaining)), 4096) // 4KB chunks
-		
-		// Wait until we have tokens available
-		for !lrw.bucket.Consume(chunkSize) {
-			// No tokens available, wait a bit
-			time.Sleep(10 * time.Millisecond)
-		}
-		
+		chunkSize := min(int64(len(remaining)), CHUNK_SIZE)
+
 		// Write the chunk
 		written, err := lrw.ResponseWriter.Write(remaining[:chunkSize])
 		totalWritten += written
-		
+
 		if err != nil {
 			return totalWritten, err
 		}
-		
+
+		// Wait until we have tokens available
+		for !lrw.bucket.Consume(int64(written)) {
+			// No tokens available, wait a bit
+			time.Sleep(10 * time.Millisecond)
+		}
+
 		remaining = remaining[written:]
 	}
-	
+
 	return totalWritten, nil
 }
 
-// Required for interface compliance, but we don't apply limiting here
-func (lrw *limitedResponseWriter) WriteHeader(statusCode int) {
-	lrw.ResponseWriter.WriteHeader(statusCode)
+// limitedReadCloser wraps io.ReadCloser to apply bandwidth limiting on uploads
+type limitedReadCloser struct {
+	io.ReadCloser
+	bucket *TokenBucket
+}
+
+// Read applies bandwidth limiting when reading request data (uploads)
+func (lrc *limitedReadCloser) Read(p []byte) (int, error) {
+	// Limit the read size to apply rate limiting more granularly
+	readSize := len(p)
+	if readSize > CHUNK_SIZE {
+		readSize = CHUNK_SIZE
+	}
+
+	// Perform the actual read
+	n, err := lrc.ReadCloser.Read(p[:readSize])
+
+	// Consume tokens based on actual bytes read
+	if n > 0 {
+		for !lrc.bucket.Consume(int64(n)) {
+			// No tokens available, wait a bit
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return n, err
 }

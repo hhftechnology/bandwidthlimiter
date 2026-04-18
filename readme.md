@@ -28,6 +28,7 @@
 - **Per-Client IP Limits**: Configure specific rates for individual client IP addresses
 - **Configurable Burst Sizes**: Allow temporary bursts above the average rate limit
 - **IPv4 and IPv6 Support**: Works with both IP address formats
+- **Upload and download control**: Limit both incoming and outgoing bandwidth
 
 ### Memory Management and Persistence
 - **Automatic Bucket Cleanup**: Periodically removes unused rate limiters to prevent memory leaks
