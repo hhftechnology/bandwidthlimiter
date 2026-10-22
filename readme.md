@@ -49,6 +49,8 @@
 
 ```bash
 # Add to your Traefik static configuration
+
+[![Discuss on the HHF forum](https://img.shields.io/badge/discuss-forum.hhf.technology-AD1457?logo=discourse&logoColor=white)](https://forum.hhf.technology/c/traefik-plugins-tools/bandwidthlimiter)
 experimental:
   plugins:
     bandwidthlimiter:
